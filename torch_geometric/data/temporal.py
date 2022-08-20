@@ -14,7 +14,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from torch_geometric.data.data import BaseData, size_repr
+from torch_geometric.data.data import BaseData, size_repr, Data
+from torch_geometric.data.collate import cumsum
 from torch_geometric.data.storage import (
     BaseStorage,
     EdgeStorage,
@@ -86,9 +87,10 @@ class TemporalData(BaseData):
         The shape of :obj:`src`, :obj:`dst`, :obj:`t` and the first dimension
         of :obj`msg` should be the same (:obj:`num_events`).
     """
+
     def __init__(
         self,
-        src: Optional[Tensor] = None,
+        src,
         dst: Optional[Tensor] = None,
         t: Optional[Tensor] = None,
         msg: Optional[Tensor] = None,
@@ -97,13 +99,77 @@ class TemporalData(BaseData):
         super().__init__()
         self.__dict__['_store'] = GlobalStorage(_parent=self)
 
+        if t is None:
+            t = torch.full_like(src, 0)
+        else:
+            src, dst, t, msg = sort_events(src, dst, t, msg)
         self.src = src
         self.dst = dst
         self.t = t
         self.msg = msg
 
+        self._unique_time, inverse_indices, counts = torch.unique_consecutive(
+            t, return_counts=True, return_inverse=True)
+        self._slices = cumsum(counts)
+
         for key, value in kwargs.items():
             setattr(self, key, value)
+
+    def snapshot(self, start: Optional[int] = None, end: Optional[int] = None):
+        """Returns the graph snapshot where events start from
+        :obj:`start`-th and end at :obj:`end`-th time step.
+        """
+        start = start or 0
+        end = end or -1
+        slices = self._slices
+        temporal_data = self[slices[start]:slices[end]]
+        edge_index = torch.stack([temporal_data.src,
+                                  temporal_data.dst], dim=0)
+        edge_attr = getattr(temporal_data, 'msg', None)
+        time_attr = temporal_data.t
+
+        return Data(edge_index=edge_index,
+                    edge_attr=edge_attr,
+                    time_attr=time_attr)
+
+    def update(self, src,
+               dst: Optional[Tensor] = None,
+               t: Optional[Tensor] = None,
+               msg: Optional[Tensor] = None):
+        """Updates the temporal graph with newly incoming events
+        :obj:`(src, dst, t, msg)`
+        """
+        src = torch.tensor(src).view(-1)
+
+        last_time = self._unique_time[-1]
+
+        if t is None:
+            t = torch.full_like(src, last_time + 1)
+        else:
+            t = torch.tensor(t).view(-1)
+            assert torch.all(t > last_time)
+
+        if dst is not None:
+            dst = torch.tensor(dst).view(-1)
+
+        if msg is not None:
+            msg = torch.tensor(msg)
+            if msg.size(0) != t.size(0):
+                msg = msg.unsqueeze(0)
+
+        src, dst, t, msg = sort_events(src, dst, t, msg)
+        unique_time, inverse_indices, counts = torch.unique_consecutive(
+            t, return_counts=True, return_inverse=True)
+        self._unique_time = torch.cat([self._unique_time, unique_time])
+        slices = cumsum(counts)
+        self._slices = torch.cat(
+            [self._slices, slices[:1] + self._slices[-1]], dim=0)
+
+        self.t = cat(self.t, t, dim=0)
+        self.src = cat(self.src, src, dim=0)
+        self.dst = cat(getattr(self, 'dst', None), dst, dim=0)
+        self.msg = cat(getattr(self, 'msg', None), msg, dim=0)
+        return self
 
     def index_select(self, idx: Any) -> 'TemporalData':
         idx = prepare_idx(idx)
@@ -208,6 +274,16 @@ class TemporalData(BaseData):
         return self.src.size(0)
 
     @property
+    def num_snapshots(self) -> int:
+        r"""Returns the number of snapshots loaded.
+
+        .. note::
+            In a :class:`~torch_geometric.data.TemporalData`, a snapshot
+            denotes a stastic graph where events occurred at the same time.
+        """
+        return self._unique_time.size(0)
+
+    @property
     def num_edges(self) -> int:
         r"""Alias for :meth:`~torch_geometric.data.TemporalData.num_events`."""
         return self.num_events
@@ -294,3 +370,25 @@ def prepare_idx(idx):
     raise IndexError(
         f"Only strings, integers, slices (`:`), list, tuples, and long or "
         f"bool tensors are valid indices (got '{type(idx).__name__}')")
+
+
+def sort_events(src, dst, t, msg):
+    assert t is not None
+    assert src is not None
+
+    idx = t.argsort()
+    src = src[idx]
+    t = t[idx]
+    if dst is not None:
+        dst = dst[idx]
+    if msg is not None:
+        msg = msg[idx]
+    return src, dst, t, msg
+
+
+def cat(x, y, dim):
+    if x is None:
+        return y
+    if y is None:
+        return x
+    return torch.cat([x, y.to(x)], dim=dim)
